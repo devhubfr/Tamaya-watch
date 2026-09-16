@@ -1,0 +1,895 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tamaya Watch</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<style>
+  html,body{margin:0;padding:0;background:#08080b;}
+  #root{min-height:100vh;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react" data-type="module">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+
+/* ============================================================
+   TAMAYA WATCH — plateforme de signalement communautaire
+   ------------------------------------------------------------
+   Démo fonctionnelle : les données (utilisateurs, signalements,
+   preuves, logs) sont stockées via window.storage (partagé entre
+   tous les membres qui ouvrent cet artefact). Toute la logique
+   de permission passe par un unique module `Backend` : l'UI
+   n'écrit jamais les données directement, elle appelle toujours
+   Backend.xxx(currentUser, ...) qui revérifie le rôle avant
+   d'agir. C'est l'équivalent le plus proche d'un vrai contrôle
+   "backend" dans un environnement qui ne peut exécuter que du
+   JavaScript côté client.
+   ============================================================ */
+
+const ROLES = ["Owner", "Watch", "Proofs", "Staff", "Member"];
+
+const ROLE_META = {
+  Owner: { emoji: "👑", color: "#ff2145", desc: "Accès complet, gère rôles, utilisateurs et paramètres." },
+  Watch: { emoji: "🔎", color: "#3aa0ff", desc: "Examine les signalements, passe le statut en vérification." },
+  Proofs: { emoji: "📁", color: "#f5c542", desc: "Consulte et organise les preuves associées." },
+  Staff: { emoji: "🛡️", color: "#34d399", desc: "Traite les signalements qui lui sont transmis." },
+  Member: { emoji: "👤", color: "#8b8791", desc: "Crée des signalements et suit les siens." },
+};
+
+const STATUS = {
+  pending: { emoji: "🟡", label: "En attente", color: "#f5c542" },
+  verifying: { emoji: "🔵", label: "En vérification", color: "#3aa0ff" },
+  verified: { emoji: "🟢", label: "Vérifié", color: "#34d399" },
+  rejected: { emoji: "🔴", label: "Rejeté", color: "#ff3b4e" },
+  archived: { emoji: "⚫", label: "Archivé", color: "#6b6b74" },
+};
+
+const REASONS = ["Arnaque / scam", "Harcèlement", "Contenu interdit", "Usurpation d'identité", "Ban evasion", "Autre"];
+
+/* ---------------- storage helpers ----------------
+   Version GitHub / navigateur classique : persistance via
+   localStorage. Chaque navigateur a ses propres données —
+   elles ne sont PAS partagées entre les membres de la
+   communauté. Pour une vraie plateforme partagée, il faut
+   remplacer ces deux fonctions par des appels à un vrai
+   backend (Supabase, Firebase, API Node.js...). */
+async function storeGet(key, _shared) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+async function storeSet(key, value, _shared) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch (e) {
+    console.error("storage set failed", e);
+    return false;
+  }
+}
+
+const K_OWNER = "tw:owner";
+const K_USERS = "tw:users";
+const K_REPORTS = "tw:reports";
+const K_LOGS = "tw:logs";
+const K_SESSION = "tw:session";
+
+function uid(prefix) {
+  return `${prefix}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase();
+}
+function fmtDate(ts) {
+  return new Date(ts).toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+/* ============================================================
+   Backend simulation — every mutation goes through here so
+   permission checks live in one place, not scattered in the UI.
+   ============================================================ */
+function makeBackend(state, setState, log) {
+  const roleOf = (pseudo) => {
+    if (!pseudo) return null;
+    if (state.owner && pseudo.toLowerCase() === state.owner.toLowerCase()) return "Owner";
+    const u = state.users.find((u) => u.pseudo.toLowerCase() === pseudo.toLowerCase());
+    return u ? u.role : "Member";
+  };
+
+  const canViewReport = (user, report) => {
+    const role = roleOf(user);
+    if (role === "Owner" || role === "Watch" || role === "Proofs") return true;
+    if (role === "Staff") return report.assignedStaff && report.assignedStaff.toLowerCase() === user.toLowerCase();
+    if (role === "Member") return report.author.toLowerCase() === user.toLowerCase();
+    return false;
+  };
+
+  const visibleReports = (user) => state.reports.filter((r) => canViewReport(user, r));
+
+  const createReport = async (user, { reportedUser, reason, description }) => {
+    const role = roleOf(user);
+    if (!role) return { ok: false, error: "Utilisateur inconnu." };
+    const report = {
+      id: uid("SIG"),
+      date: Date.now(),
+      author: user,
+      reportedUser,
+      reason,
+      description,
+      status: "pending",
+      assignedStaff: null,
+      evidence: [],
+      notes: [],
+      history: [{ date: Date.now(), by: user, text: "Signalement créé." }],
+    };
+    const reports = [report, ...state.reports];
+    await storeSet(K_REPORTS, reports, true);
+    setState((s) => ({ ...s, reports }));
+    log(user, "Création signalement", `${report.id} — ${reportedUser}`);
+    return { ok: true, report };
+  };
+
+  const addNote = async (user, reportId, text) => {
+    const role = roleOf(user);
+    if (!["Owner", "Watch", "Proofs", "Staff"].includes(role) && !state.reports.find((r) => r.id === reportId && r.author.toLowerCase() === user.toLowerCase())) {
+      return { ok: false, error: "Permission refusée." };
+    }
+    const reports = state.reports.map((r) => {
+      if (r.id !== reportId) return r;
+      if (!canViewReport(user, r)) return r;
+      return { ...r, notes: [...r.notes, { text, by: user, role, date: Date.now() }] };
+    });
+    await storeSet(K_REPORTS, reports, true);
+    setState((s) => ({ ...s, reports }));
+    log(user, "Ajout note", reportId);
+    return { ok: true };
+  };
+
+  const addEvidence = async (user, reportId, text) => {
+    const role = roleOf(user);
+    if (!["Owner", "Proofs"].includes(role)) return { ok: false, error: "Seuls Owner et Proofs peuvent ajouter des preuves." };
+    const reports = state.reports.map((r) => (r.id === reportId ? { ...r, evidence: [...r.evidence, { text, by: user, date: Date.now() }] } : r));
+    await storeSet(K_REPORTS, reports, true);
+    setState((s) => ({ ...s, reports }));
+    log(user, "Ajout preuve", reportId);
+    return { ok: true };
+  };
+
+  const setStatus = async (user, reportId, newStatus) => {
+    const role = roleOf(user);
+    const report = state.reports.find((r) => r.id === reportId);
+    if (!report) return { ok: false, error: "Introuvable." };
+    const isFinal = ["verified", "rejected", "archived"].includes(newStatus);
+    if (isFinal && role !== "Owner") return { ok: false, error: "Seul le Owner peut finaliser un statut." };
+    if (newStatus === "verifying" && !["Owner", "Watch"].includes(role)) return { ok: false, error: "Seuls Owner et Watch peuvent passer en vérification." };
+    const reports = state.reports.map((r) =>
+      r.id === reportId
+        ? { ...r, status: newStatus, history: [...r.history, { date: Date.now(), by: user, text: `Statut → ${STATUS[newStatus].label}` }] }
+        : r
+    );
+    await storeSet(K_REPORTS, reports, true);
+    setState((s) => ({ ...s, reports }));
+    log(user, "Changement statut", `${reportId} → ${STATUS[newStatus].label}`);
+    return { ok: true };
+  };
+
+  const assignStaff = async (user, reportId, staffPseudo) => {
+    const role = roleOf(user);
+    if (role !== "Owner") return { ok: false, error: "Seul le Owner assigne un signalement." };
+    const reports = state.reports.map((r) =>
+      r.id === reportId ? { ...r, assignedStaff: staffPseudo, history: [...r.history, { date: Date.now(), by: user, text: `Transmis à ${staffPseudo}` }] } : r
+    );
+    await storeSet(K_REPORTS, reports, true);
+    setState((s) => ({ ...s, reports }));
+    log(user, "Transmission", `${reportId} → ${staffPseudo}`);
+    return { ok: true };
+  };
+
+  const setRole = async (user, targetPseudo, newRole) => {
+    const role = roleOf(user);
+    if (role !== "Owner") return { ok: false, error: "Seul le Owner gère les rôles." };
+    if (state.owner && targetPseudo.toLowerCase() === state.owner.toLowerCase()) return { ok: false, error: "Le Owner ne peut pas être modifié." };
+    if (newRole === "Owner") return { ok: false, error: "Il ne peut y avoir qu'un seul Owner." };
+    let users = state.users;
+    const exists = users.find((u) => u.pseudo.toLowerCase() === targetPseudo.toLowerCase());
+    if (exists) {
+      users = users.map((u) => (u.pseudo.toLowerCase() === targetPseudo.toLowerCase() ? { ...u, role: newRole } : u));
+    } else {
+      users = [...users, { pseudo: targetPseudo, role: newRole, addedAt: Date.now(), addedBy: user }];
+    }
+    await storeSet(K_USERS, users, true);
+    setState((s) => ({ ...s, users }));
+    log(user, "Rôle attribué", `${targetPseudo} → ${newRole}`);
+    return { ok: true };
+  };
+
+  const claimOwner = async (pseudo) => {
+    if (state.owner) return { ok: false, error: "Un Owner existe déjà." };
+    await storeSet(K_OWNER, pseudo, true);
+    setState((s) => ({ ...s, owner: pseudo }));
+    log(pseudo, "Configuration initiale", "Owner défini");
+    return { ok: true };
+  };
+
+  return { roleOf, canViewReport, visibleReports, createReport, addNote, addEvidence, setStatus, assignStaff, setRole, claimOwner };
+}
+
+/* ============================================================
+   UI
+   ============================================================ */
+function TamayaWatch() {
+  const [loaded, setLoaded] = useState(false);
+  const [state, setState] = useState({ owner: null, users: [], reports: [], logs: [] });
+  const [session, setSession] = useState(null); // pseudo string
+  const [pseudoInput, setPseudoInput] = useState("");
+  const [page, setPage] = useState("home");
+  const [navOpen, setNavOpen] = useState(false);
+
+  const log = useCallback(async (actor, action, details) => {
+    setState((s) => {
+      const entry = { date: Date.now(), actor, action, details };
+      const logs = [entry, ...s.logs].slice(0, 500);
+      storeSet(K_LOGS, logs, true);
+      return { ...s, logs };
+    });
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      const [owner, users, reports, logs, sess] = await Promise.all([
+        storeGet(K_OWNER, true),
+        storeGet(K_USERS, true),
+        storeGet(K_REPORTS, true),
+        storeGet(K_LOGS, true),
+        storeGet(K_SESSION, false),
+      ]);
+      setState({ owner: owner || null, users: users || [], reports: reports || [], logs: logs || [] });
+      if (sess && sess.pseudo) setSession(sess.pseudo);
+      setLoaded(true);
+    })();
+  }, []);
+
+  const backend = useMemo(() => makeBackend(state, setState, log), [state, log]);
+  const role = session ? backend.roleOf(session) : null;
+
+  const login = async (pseudo) => {
+    const clean = pseudo.trim();
+    if (!clean) return;
+    await storeSet(K_SESSION, { pseudo: clean }, false);
+    setSession(clean);
+    setPage("home");
+  };
+  const logout = async () => {
+    await storeSet(K_SESSION, null, false);
+    setSession(null);
+  };
+  const claimOwnerAndLogin = async (pseudo) => {
+    const res = await backend.claimOwner(pseudo);
+    if (res.ok) await login(pseudo);
+    return res;
+  };
+  const resetOwnerConfig = async () => {
+    await storeSet(K_OWNER, null, true);
+    await storeSet(K_USERS, [], true);
+    await storeSet(K_SESSION, null, false);
+    setState((s) => ({ ...s, owner: null, users: [] }));
+    setSession(null);
+  };
+
+  const NAV = [
+    { key: "home", label: "Accueil", show: true },
+    { key: "how", label: "Fonctionnement", show: true },
+    { key: "new-report", label: "Faire un signalement", show: !!session },
+    { key: "my-reports", label: "Mes signalements", show: !!session },
+    { key: "dashboard", label: "Dashboard", show: role === "Owner" },
+    { key: "reports", label: "Signalements", show: ["Owner", "Watch", "Proofs", "Staff"].includes(role) },
+    { key: "evidence", label: "Preuves", show: ["Owner", "Proofs"].includes(role) },
+    { key: "members", label: "Membres", show: role === "Owner" },
+    { key: "roles", label: "Gestion des rôles", show: role === "Owner" },
+    { key: "logs", label: "Logs", show: role === "Owner" },
+    { key: "settings", label: "Paramètres", show: role === "Owner" },
+  ].filter((n) => n.show);
+
+  if (!loaded) {
+    return (
+      <div style={{ background: "#08080b", minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <GlobalStyle />
+        <div className="tw-loading">INITIALISATION…</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="tw-root">
+      <GlobalStyle />
+      {!state.owner ? (
+        <OwnerSetup onClaim={claimOwnerAndLogin} />
+      ) : !session ? (
+        <LoginScreen
+          value={pseudoInput}
+          onChange={setPseudoInput}
+          onSubmit={() => login(pseudoInput)}
+          canReset={state.reports.length === 0}
+          onReset={resetOwnerConfig}
+        />
+      ) : (
+        <div className="tw-shell">
+          <Sidebar nav={NAV} page={page} setPage={setPage} session={session} role={role} onLogout={logout} open={navOpen} setOpen={setNavOpen} />
+          <main className="tw-main">
+            <TopBar session={session} role={role} onOpenNav={() => setNavOpen(true)} page={page} />
+            <div className="tw-content">
+              {page === "home" && <Home setPage={setPage} session={session} role={role} />}
+              {page === "how" && <HowItWorks />}
+              {page === "new-report" && <NewReport backend={backend} session={session} setPage={setPage} />}
+              {page === "my-reports" && <MyReports backend={backend} session={session} state={state} />}
+              {page === "dashboard" && role === "Owner" && <Dashboard state={state} setPage={setPage} />}
+              {page === "reports" && ["Owner", "Watch", "Proofs", "Staff"].includes(role) && (
+                <ReportsPanel backend={backend} session={session} role={role} state={state} />
+              )}
+              {page === "evidence" && ["Owner", "Proofs"].includes(role) && <EvidencePanel state={state} backend={backend} session={session} />}
+              {page === "members" && role === "Owner" && <MembersPanel state={state} />}
+              {page === "roles" && role === "Owner" && <RolesPanel state={state} backend={backend} session={session} />}
+              {page === "logs" && role === "Owner" && <LogsPanel state={state} />}
+              {page === "settings" && role === "Owner" && <SettingsPanel state={state} />}
+            </div>
+          </main>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- shared bits ---------------- */
+
+function GlobalStyle() {
+  return (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+      .tw-root{
+        --bg:#08080b; --panel:#111116; --panel-2:#16161c; --border:#241118; --border-soft:#1c1c22;
+        --red:#ff2145; --red-dim:#7a0f24; --text:#eae8ec; --muted:#8b8791;
+        font-family:'IBM Plex Sans',sans-serif; color:var(--text); background:var(--bg);
+        min-height:100vh; position:relative;
+      }
+      .tw-root::before{
+        content:''; position:fixed; inset:0; pointer-events:none; z-index:0;
+        background-image:
+          radial-gradient(600px 300px at 15% -10%, rgba(255,33,69,0.08), transparent 60%),
+          repeating-linear-gradient(180deg, rgba(255,255,255,0.012) 0px, rgba(255,255,255,0.012) 1px, transparent 1px, transparent 3px);
+      }
+      .tw-root *{box-sizing:border-box;}
+      h1,h2,h3,.tw-display{font-family:'Space Grotesk',sans-serif;}
+      .tw-mono{font-family:'JetBrains Mono',monospace;}
+      .tw-loading{color:var(--red); font-family:'JetBrains Mono',monospace; letter-spacing:2px;}
+      .tw-btn{
+        background:var(--red); color:#fff; border:none; padding:10px 18px; border-radius:6px;
+        font-weight:600; cursor:pointer; font-size:14px; transition:transform .12s ease, box-shadow .12s ease;
+        box-shadow:0 0 0 rgba(255,33,69,0);
+      }
+      .tw-btn:hover{ box-shadow:0 0 24px rgba(255,33,69,0.35); transform:translateY(-1px); }
+      .tw-btn:disabled{ opacity:.4; cursor:not-allowed; box-shadow:none; transform:none; }
+      .tw-btn-outline{
+        background:transparent; color:var(--text); border:1px solid var(--border-soft); padding:10px 18px;
+        border-radius:6px; font-weight:500; cursor:pointer; font-size:14px; transition:border-color .12s ease;
+      }
+      .tw-btn-outline:hover{ border-color:var(--red); }
+      .tw-input, .tw-textarea, .tw-select{
+        background:var(--panel-2); border:1px solid var(--border-soft); color:var(--text); border-radius:6px;
+        padding:10px 12px; font-size:14px; width:100%; font-family:inherit;
+      }
+      .tw-input:focus, .tw-textarea:focus, .tw-select:focus{ outline:none; border-color:var(--red); }
+      .tw-card{
+        background:var(--panel); border:1px solid var(--border-soft); border-radius:10px; padding:20px;
+      }
+      .tw-pill{ display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; font-size:12.5px; font-weight:500; }
+      .tw-label-muted{ color:var(--muted); font-size:12.5px; }
+      .tw-shell{ display:flex; min-height:100vh; position:relative; z-index:1; }
+      .tw-main{ flex:1; min-width:0; }
+      .tw-content{ padding:28px 24px 60px; }
+      @media (max-width:880px){ .tw-content{ padding:20px 16px 50px; } }
+    `}</style>
+  );
+}
+
+function OwnerSetup({ onClaim }) {
+  const [val, setVal] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div className="tw-card" style={{ maxWidth: 440, width: "100%" }}>
+        <div style={{ color: "#ff2145", fontSize: 13, fontFamily: "JetBrains Mono, monospace", marginBottom: 8 }}>CONFIGURATION INITIALE</div>
+        <h1 style={{ fontSize: 24, margin: "0 0 10px" }}>Définir le Owner</h1>
+        <p style={{ color: "#8b8791", fontSize: 14, lineHeight: 1.6, marginBottom: 18 }}>
+          Cette étape n'a lieu qu'une seule fois. Le pseudo saisi ici deviendra l'unique Owner de Tamaya Watch, avec
+          tous les droits. Personne d'autre ne pourra prendre ce rôle par la suite.
+        </p>
+        <input className="tw-input" placeholder="Votre pseudo" value={val} onChange={(e) => setVal(e.target.value)} style={{ marginBottom: 14 }} />
+        <button
+          className="tw-btn"
+          disabled={!val.trim() || busy}
+          onClick={async () => {
+            setBusy(true);
+            await onClaim(val.trim());
+            setBusy(false);
+          }}
+        >
+          Devenir Owner
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function LoginScreen({ value, onChange, onSubmit, canReset, onReset }) {
+  const [confirming, setConfirming] = useState(false);
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div className="tw-card" style={{ maxWidth: 400, width: "100%" }}>
+        <div style={{ color: "#ff2145", fontSize: 13, fontFamily: "JetBrains Mono, monospace", marginBottom: 8 }}>TAMAYA WATCH</div>
+        <h1 style={{ fontSize: 22, margin: "0 0 10px" }}>Entrez votre pseudo</h1>
+        <p className="tw-label-muted" style={{ marginBottom: 16, lineHeight: 1.6 }}>
+          Aucun mot de passe : votre pseudo identifie votre rôle dans la communauté. Si c'est votre première visite,
+          vous serez ajouté en tant que Member.
+        </p>
+        <input
+          className="tw-input"
+          placeholder="ex : didi"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && onSubmit()}
+          style={{ marginBottom: 14 }}
+        />
+        <button className="tw-btn" disabled={!value.trim()} onClick={onSubmit}>Entrer</button>
+
+        {canReset && (
+          <div style={{ marginTop: 20, paddingTop: 16, borderTop: "1px solid #1c1c22" }}>
+            {!confirming ? (
+              <button className="tw-label-muted" style={{ background: "none", border: "none", cursor: "pointer", textDecoration: "underline", fontSize: 12.5, padding: 0 }} onClick={() => setConfirming(true)}>
+                Configuration incorrecte ? Réinitialiser le Owner
+              </button>
+            ) : (
+              <div>
+                <div className="tw-label-muted" style={{ marginBottom: 8, lineHeight: 1.6 }}>
+                  Aucun signalement n'existe encore, la réinitialisation est donc sans risque. Cela effacera le Owner
+                  et les rôles attribués pour recommencer la configuration initiale. Confirmer ?
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="tw-btn" style={{ background: "#ff3b4e" }} onClick={onReset}>Oui, réinitialiser</button>
+                  <button className="tw-btn-outline" onClick={() => setConfirming(false)}>Annuler</button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Sidebar({ nav, page, setPage, session, role, onLogout, open, setOpen }) {
+  return (
+    <>
+      {open && <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 30 }} className="tw-only-mobile" />}
+      <aside className={`tw-sidebar ${open ? "tw-sidebar-open" : ""}`}>
+        <style>{`
+          .tw-sidebar{ width:230px; background:#0c0c10; border-right:1px solid #1c1c22; padding:20px 14px; display:flex; flex-direction:column; gap:4px; position:sticky; top:0; height:100vh; overflow-y:auto; z-index:31; }
+          .tw-navitem{ display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:7px; color:#8b8791; font-size:14px; cursor:pointer; transition:background .12s, color .12s; }
+          .tw-navitem:hover{ background:#16161c; color:#eae8ec; }
+          .tw-navitem-active{ background:linear-gradient(90deg, rgba(255,33,69,0.16), rgba(255,33,69,0.02)); color:#fff; border-left:2px solid #ff2145; padding-left:10px; }
+          .tw-only-mobile{ display:none; }
+          @media (max-width: 880px){
+            .tw-sidebar{ position:fixed; left:-250px; top:0; transition:left .18s ease; box-shadow:0 0 40px rgba(0,0,0,.6); }
+            .tw-sidebar-open{ left:0; }
+            .tw-only-mobile{ display:block; }
+          }
+        `}</style>
+        <div style={{ padding: "6px 8px 18px" }}>
+          <div className="tw-display" style={{ fontWeight: 700, fontSize: 17, letterSpacing: .2 }}>
+            <span style={{ color: "#ff2145" }}>Tamaya</span> Watch
+          </div>
+        </div>
+        {nav.map((n) => (
+          <div key={n.key} className={`tw-navitem ${page === n.key ? "tw-navitem-active" : ""}`} onClick={() => { setPage(n.key); setOpen(false); }}>
+            {n.label}
+          </div>
+        ))}
+        <div style={{ flex: 1 }} />
+        <div style={{ borderTop: "1px solid #1c1c22", paddingTop: 12, marginTop: 8 }}>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>{ROLE_META[role]?.emoji} {session}</div>
+          <div className="tw-label-muted" style={{ marginBottom: 10 }}>{role}</div>
+          <button className="tw-btn-outline" style={{ width: "100%", fontSize: 13, padding: "8px 10px" }} onClick={onLogout}>Changer de pseudo</button>
+        </div>
+      </aside>
+    </>
+  );
+}
+
+function TopBar({ role, page, onOpenNav }) {
+  const titles = {
+    home: "Accueil", how: "Fonctionnement", "new-report": "Faire un signalement", "my-reports": "Mes signalements",
+    dashboard: "Dashboard Owner", reports: "Signalements", evidence: "Preuves", members: "Membres",
+    roles: "Gestion des rôles", logs: "Journal des actions", settings: "Paramètres",
+  };
+  return (
+    <div style={{ position: "sticky", top: 0, zIndex: 5, background: "rgba(8,8,11,0.85)", backdropFilter: "blur(6px)", borderBottom: "1px solid #1c1c22", padding: "14px 24px", display: "flex", alignItems: "center", gap: 14 }}>
+      <button className="tw-only-mobile tw-btn-outline" style={{ padding: "6px 10px" }} onClick={onOpenNav}>☰</button>
+      <h2 style={{ margin: 0, fontSize: 18 }}>{titles[page]}</h2>
+      {role && <span className="tw-pill" style={{ marginLeft: "auto", background: "rgba(255,33,69,0.1)", color: "#ff2145", border: "1px solid rgba(255,33,69,0.3)" }}>{ROLE_META[role].emoji} {role}</span>}
+    </div>
+  );
+}
+
+/* ---------------- pages ---------------- */
+
+function Home({ setPage, session, role }) {
+  return (
+    <div style={{ maxWidth: 760 }}>
+      <div style={{ color: "#ff2145", fontFamily: "JetBrains Mono, monospace", fontSize: 13, marginBottom: 10 }}>SURVEILLANCE COMMUNAUTAIRE</div>
+      <h1 style={{ fontSize: 34, lineHeight: 1.15, margin: "0 0 16px" }}>Signaler un problème, garder une trace, décider avec des preuves.</h1>
+      <p style={{ color: "#8b8791", fontSize: 15.5, lineHeight: 1.7, marginBottom: 24 }}>
+        Tamaya Watch centralise les signalements de la communauté Discord : chaque membre peut déclarer un
+        problème, l'équipe autorisée l'examine, ajoute des preuves et fait évoluer son statut jusqu'à décision.
+        Aucun chiffre affiché ici n'est fictif — les compteurs reflètent uniquement les signalements réellement
+        enregistrés dans cette instance.
+      </p>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <button className="tw-btn" onClick={() => setPage("new-report")}>Faire un signalement</button>
+        <button className="tw-btn-outline" onClick={() => setPage("how")}>Comment ça marche</button>
+      </div>
+      <div style={{ marginTop: 36, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px,1fr))", gap: 14 }}>
+        {Object.entries(STATUS).map(([k, v]) => (
+          <div key={k} className="tw-card" style={{ padding: 14 }}>
+            <div className="tw-pill" style={{ background: `${v.color}1a`, color: v.color, border: `1px solid ${v.color}55` }}>{v.emoji} {v.label}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function HowItWorks() {
+  return (
+    <div style={{ maxWidth: 760 }}>
+      <p style={{ color: "#8b8791", lineHeight: 1.7, marginBottom: 24 }}>
+        Le fonctionnement repose sur cinq rôles distincts. Chacun ne voit et ne modifie que ce que sa fonction exige —
+        ces règles sont vérifiées à chaque action, pas seulement cachées dans l'interface.
+      </p>
+      <div style={{ display: "grid", gap: 12 }}>
+        {ROLES.map((r) => (
+          <div key={r} className="tw-card" style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+            <div style={{ fontSize: 22 }}>{ROLE_META[r].emoji}</div>
+            <div>
+              <div style={{ fontWeight: 600 }}>{r}</div>
+              <div className="tw-label-muted">{ROLE_META[r].desc}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="tw-card" style={{ marginTop: 20 }}>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Cycle de vie d'un signalement</div>
+        <div className="tw-label-muted" style={{ lineHeight: 1.8 }}>
+          🟡 En attente → 🔵 En vérification (Watch) → 🟢 Vérifié / 🔴 Rejeté / ⚫ Archivé (décision finale, réservée au Owner).
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NewReport({ backend, session, setPage }) {
+  const [reportedUser, setReportedUser] = useState("");
+  const [reason, setReason] = useState(REASONS[0]);
+  const [description, setDescription] = useState("");
+  const [done, setDone] = useState(null);
+  const [err, setErr] = useState("");
+
+  const submit = async () => {
+    setErr("");
+    if (!reportedUser.trim() || !description.trim()) { setErr("Merci de remplir l'utilisateur signalé et la description."); return; }
+    const res = await backend.createReport(session, { reportedUser: reportedUser.trim(), reason, description: description.trim() });
+    if (res.ok) setDone(res.report);
+    else setErr(res.error);
+  };
+
+  if (done) {
+    return (
+      <div className="tw-card" style={{ maxWidth: 520 }}>
+        <div style={{ color: "#34d399", fontWeight: 600, marginBottom: 8 }}>Signalement enregistré</div>
+        <div className="tw-mono" style={{ color: "#8b8791", marginBottom: 16 }}>{done.id}</div>
+        <button className="tw-btn" onClick={() => setPage("my-reports")}>Voir mes signalements</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="tw-card" style={{ maxWidth: 520 }}>
+      <label className="tw-label-muted">Utilisateur signalé (pseudo Discord)</label>
+      <input className="tw-input" style={{ margin: "6px 0 16px" }} value={reportedUser} onChange={(e) => setReportedUser(e.target.value)} placeholder="ex : pseudo#0000" />
+
+      <label className="tw-label-muted">Motif</label>
+      <select className="tw-select" style={{ margin: "6px 0 16px" }} value={reason} onChange={(e) => setReason(e.target.value)}>
+        {REASONS.map((r) => <option key={r} value={r}>{r}</option>)}
+      </select>
+
+      <label className="tw-label-muted">Description détaillée</label>
+      <textarea className="tw-textarea" style={{ margin: "6px 0 16px", minHeight: 120 }} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Que s'est-il passé ? Contexte, dates, liens éventuels…" />
+
+      {err && <div style={{ color: "#ff3b4e", fontSize: 13, marginBottom: 12 }}>{err}</div>}
+      <button className="tw-btn" onClick={submit}>Envoyer le signalement</button>
+      <div className="tw-label-muted" style={{ marginTop: 10 }}>Vous pourrez ajouter des preuves ou informations complémentaires depuis « Mes signalements ».</div>
+    </div>
+  );
+}
+
+function ReportCard({ report, children }) {
+  const s = STATUS[report.status];
+  return (
+    <div className="tw-card">
+      <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+        <div className="tw-mono" style={{ color: "#8b8791", fontSize: 13 }}>{report.id} · {fmtDate(report.date)}</div>
+        <span className="tw-pill" style={{ background: `${s.color}1a`, color: s.color, border: `1px solid ${s.color}55` }}>{s.emoji} {s.label}</span>
+      </div>
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>Signalé : {report.reportedUser}</div>
+      <div className="tw-label-muted" style={{ marginBottom: 8 }}>Motif : {report.reason} · Par {report.author}</div>
+      <div style={{ fontSize: 14.5, lineHeight: 1.6, marginBottom: 12 }}>{report.description}</div>
+      {children}
+    </div>
+  );
+}
+
+function MyReports({ backend, session, state }) {
+  const mine = state.reports.filter((r) => r.author.toLowerCase() === session.toLowerCase());
+  const [noteDraft, setNoteDraft] = useState({});
+
+  if (!mine.length) return <div className="tw-label-muted">Vous n'avez encore fait aucun signalement.</div>;
+
+  return (
+    <div style={{ display: "grid", gap: 14, maxWidth: 640 }}>
+      {mine.map((r) => (
+        <ReportCard key={r.id} report={r}>
+          {r.notes.length > 0 && (
+            <div style={{ marginBottom: 10, display: "grid", gap: 6 }}>
+              {r.notes.map((n, i) => (
+                <div key={i} className="tw-label-muted" style={{ fontSize: 13 }}>💬 <b style={{ color: "#eae8ec" }}>{n.by}</b> ({n.role}) — {n.text}</div>
+              ))}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8 }}>
+            <input className="tw-input" placeholder="Ajouter une information" value={noteDraft[r.id] || ""} onChange={(e) => setNoteDraft((d) => ({ ...d, [r.id]: e.target.value }))} />
+            <button className="tw-btn-outline" onClick={async () => { if (!noteDraft[r.id]?.trim()) return; await backend.addNote(session, r.id, noteDraft[r.id].trim()); setNoteDraft((d) => ({ ...d, [r.id]: "" })); }}>Ajouter</button>
+          </div>
+        </ReportCard>
+      ))}
+    </div>
+  );
+}
+
+function ReportsPanel({ backend, session, role, state }) {
+  const reports = backend.visibleReports(session);
+  const [filter, setFilter] = useState("all");
+  const [noteDraft, setNoteDraft] = useState({});
+  const [evDraft, setEvDraft] = useState({});
+  const [assignDraft, setAssignDraft] = useState({});
+
+  const filtered = filter === "all" ? reports : reports.filter((r) => r.status === filter);
+  const staffList = state.users.filter((u) => u.role === "Staff");
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 18, flexWrap: "wrap" }}>
+        <button className={`tw-btn-outline`} style={filter === "all" ? { borderColor: "#ff2145" } : {}} onClick={() => setFilter("all")}>Tous</button>
+        {Object.entries(STATUS).map(([k, v]) => (
+          <button key={k} className="tw-btn-outline" style={filter === k ? { borderColor: v.color, color: v.color } : {}} onClick={() => setFilter(k)}>{v.emoji} {v.label}</button>
+        ))}
+      </div>
+      {!filtered.length && <div className="tw-label-muted">Aucun signalement dans cette catégorie.</div>}
+      <div style={{ display: "grid", gap: 14, maxWidth: 700 }}>
+        {filtered.map((r) => (
+          <ReportCard key={r.id} report={r}>
+            {r.assignedStaff && <div className="tw-label-muted" style={{ marginBottom: 8 }}>Transmis à : {r.assignedStaff}</div>}
+            {r.evidence.length > 0 && (
+              <div style={{ marginBottom: 10, display: "grid", gap: 4 }}>
+                <div className="tw-label-muted" style={{ fontWeight: 600 }}>Preuves</div>
+                {r.evidence.map((e, i) => <div key={i} style={{ fontSize: 13.5 }}>📁 {e.text} <span className="tw-label-muted">— {e.by}</span></div>)}
+              </div>
+            )}
+            {r.notes.length > 0 && (
+              <div style={{ marginBottom: 10, display: "grid", gap: 4 }}>
+                {r.notes.map((n, i) => <div key={i} className="tw-label-muted" style={{ fontSize: 13 }}>💬 <b style={{ color: "#eae8ec" }}>{n.by}</b> ({n.role}) — {n.text}</div>)}
+              </div>
+            )}
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+              {(role === "Owner" || role === "Watch") && r.status === "pending" && (
+                <button className="tw-btn-outline" onClick={() => backend.setStatus(session, r.id, "verifying")}>Passer en vérification</button>
+              )}
+              {role === "Owner" && (
+                <>
+                  <button className="tw-btn-outline" style={{ color: "#34d399", borderColor: "#34d39955" }} onClick={() => backend.setStatus(session, r.id, "verified")}>Vérifié</button>
+                  <button className="tw-btn-outline" style={{ color: "#ff3b4e", borderColor: "#ff3b4e55" }} onClick={() => backend.setStatus(session, r.id, "rejected")}>Rejeter</button>
+                  <button className="tw-btn-outline" onClick={() => backend.setStatus(session, r.id, "archived")}>Archiver</button>
+                </>
+              )}
+            </div>
+
+            {role === "Owner" && staffList.length > 0 && (
+              <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                <select className="tw-select" value={assignDraft[r.id] || ""} onChange={(e) => setAssignDraft((d) => ({ ...d, [r.id]: e.target.value }))}>
+                  <option value="">Transmettre à…</option>
+                  {staffList.map((s) => <option key={s.pseudo} value={s.pseudo}>{s.pseudo}</option>)}
+                </select>
+                <button className="tw-btn-outline" onClick={() => assignDraft[r.id] && backend.assignStaff(session, r.id, assignDraft[r.id])}>Transmettre</button>
+              </div>
+            )}
+
+            {(role === "Owner" || role === "Proofs") && (
+              <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                <input className="tw-input" placeholder="Ajouter une preuve (lien, référence…)" value={evDraft[r.id] || ""} onChange={(e) => setEvDraft((d) => ({ ...d, [r.id]: e.target.value }))} />
+                <button className="tw-btn-outline" onClick={async () => { if (!evDraft[r.id]?.trim()) return; await backend.addEvidence(session, r.id, evDraft[r.id].trim()); setEvDraft((d) => ({ ...d, [r.id]: "" })); }}>Ajouter</button>
+              </div>
+            )}
+
+            <div style={{ display: "flex", gap: 8 }}>
+              <input className="tw-input" placeholder="Ajouter une note" value={noteDraft[r.id] || ""} onChange={(e) => setNoteDraft((d) => ({ ...d, [r.id]: e.target.value }))} />
+              <button className="tw-btn-outline" onClick={async () => { if (!noteDraft[r.id]?.trim()) return; await backend.addNote(session, r.id, noteDraft[r.id].trim()); setNoteDraft((d) => ({ ...d, [r.id]: "" })); }}>Note</button>
+            </div>
+          </ReportCard>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EvidencePanel({ state, backend, session }) {
+  const items = [];
+  state.reports.forEach((r) => r.evidence.forEach((e, i) => items.push({ ...e, reportId: r.id, reportedUser: r.reportedUser, idx: i })));
+  items.sort((a, b) => b.date - a.date);
+  if (!items.length) return <div className="tw-label-muted">Aucune preuve enregistrée pour le moment.</div>;
+  return (
+    <div style={{ display: "grid", gap: 10, maxWidth: 640 }}>
+      {items.map((e, i) => (
+        <div key={i} className="tw-card" style={{ padding: 14 }}>
+          <div className="tw-mono" style={{ color: "#8b8791", fontSize: 12.5, marginBottom: 4 }}>{e.reportId} · {fmtDate(e.date)}</div>
+          <div style={{ fontSize: 14.5 }}>📁 {e.text}</div>
+          <div className="tw-label-muted" style={{ marginTop: 4 }}>Concerne : {e.reportedUser} · ajouté par {e.by}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Dashboard({ state, setPage }) {
+  const counts = { pending: 0, verifying: 0, verified: 0, rejected: 0, archived: 0 };
+  state.reports.forEach((r) => counts[r.status]++);
+  const cards = [
+    { label: "Total signalements", value: state.reports.length, color: "#ff2145" },
+    { label: "En attente", value: counts.pending, color: STATUS.pending.color },
+    { label: "En vérification", value: counts.verifying, color: STATUS.verifying.color },
+    { label: "Vérifiés", value: counts.verified, color: STATUS.verified.color },
+    { label: "Rejetés", value: counts.rejected, color: STATUS.rejected.color },
+    { label: "Archivés", value: counts.archived, color: STATUS.archived.color },
+    { label: "Membres suivis", value: state.users.length, color: "#8b8791" },
+  ];
+  return (
+    <div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 14, marginBottom: 26 }}>
+        {cards.map((c) => (
+          <div key={c.label} className="tw-card">
+            <div style={{ fontSize: 28, fontWeight: 700, color: c.color }} className="tw-mono">{c.value}</div>
+            <div className="tw-label-muted">{c.label}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <button className="tw-btn-outline" onClick={() => setPage("roles")}>Gestion des rôles</button>
+        <button className="tw-btn-outline" onClick={() => setPage("members")}>Membres</button>
+        <button className="tw-btn-outline" onClick={() => setPage("logs")}>Journal des actions</button>
+        <button className="tw-btn-outline" onClick={() => setPage("reports")}>Voir les signalements</button>
+      </div>
+    </div>
+  );
+}
+
+function MembersPanel({ state }) {
+  const all = [...state.users];
+  if (state.owner) all.unshift({ pseudo: state.owner, role: "Owner", addedAt: null });
+  return (
+    <div style={{ display: "grid", gap: 8, maxWidth: 560 }}>
+      {all.map((u) => (
+        <div key={u.pseudo} className="tw-card" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: 14 }}>
+          <div style={{ fontWeight: 500 }}>{u.pseudo}</div>
+          <span className="tw-pill" style={{ background: `${ROLE_META[u.role].color}1a`, color: ROLE_META[u.role].color, border: `1px solid ${ROLE_META[u.role].color}55` }}>{ROLE_META[u.role].emoji} {u.role}</span>
+        </div>
+      ))}
+      {all.length === 0 && <div className="tw-label-muted">Aucun membre pour l'instant.</div>}
+    </div>
+  );
+}
+
+function RolesPanel({ state, backend, session }) {
+  const [pseudo, setPseudo] = useState("");
+  const [role, setRole] = useState("Member");
+  const [msg, setMsg] = useState("");
+  const assignable = ROLES.filter((r) => r !== "Owner");
+
+  const submit = async () => {
+    if (!pseudo.trim()) return;
+    const res = await backend.setRole(session, pseudo.trim(), role);
+    setMsg(res.ok ? `Rôle mis à jour pour ${pseudo.trim()}.` : res.error);
+    if (res.ok) setPseudo("");
+  };
+
+  return (
+    <div style={{ maxWidth: 560 }}>
+      <div className="tw-card" style={{ marginBottom: 20 }}>
+        <div style={{ fontWeight: 600, marginBottom: 12 }}>Attribuer un rôle</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <input className="tw-input" style={{ flex: 1, minWidth: 160 }} placeholder="Pseudo du membre" value={pseudo} onChange={(e) => setPseudo(e.target.value)} />
+          <select className="tw-select" style={{ maxWidth: 160 }} value={role} onChange={(e) => setRole(e.target.value)}>
+            {assignable.map((r) => <option key={r} value={r}>{ROLE_META[r].emoji} {r}</option>)}
+          </select>
+          <button className="tw-btn" onClick={submit}>Appliquer</button>
+        </div>
+        {msg && <div className="tw-label-muted" style={{ marginTop: 10 }}>{msg}</div>}
+        <div className="tw-label-muted" style={{ marginTop: 10, lineHeight: 1.6 }}>
+          Aucune création de compte n'est nécessaire : entrez simplement le pseudo du membre. Le rôle Owner ne peut
+          jamais être attribué depuis cette page — il n'existe qu'un seul Owner, défini à la configuration initiale.
+        </div>
+      </div>
+      <div style={{ display: "grid", gap: 8 }}>
+        {state.users.map((u) => (
+          <div key={u.pseudo} className="tw-card" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: 12 }}>
+            <div>{u.pseudo}</div>
+            <span className="tw-pill" style={{ background: `${ROLE_META[u.role].color}1a`, color: ROLE_META[u.role].color }}>{ROLE_META[u.role].emoji} {u.role}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function LogsPanel({ state }) {
+  if (!state.logs.length) return <div className="tw-label-muted">Aucune action enregistrée pour le moment.</div>;
+  return (
+    <div style={{ display: "grid", gap: 6, maxWidth: 700 }}>
+      {state.logs.map((l, i) => (
+        <div key={i} className="tw-card" style={{ padding: "10px 14px", display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <span className="tw-mono" style={{ color: "#8b8791", fontSize: 12.5, minWidth: 130 }}>{fmtDate(l.date)}</span>
+          <span style={{ fontWeight: 600 }}>{l.actor}</span>
+          <span style={{ color: "#ff2145" }}>{l.action}</span>
+          <span className="tw-label-muted">{l.details}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SettingsPanel({ state }) {
+  return (
+    <div className="tw-card" style={{ maxWidth: 560 }}>
+      <div style={{ fontWeight: 600, marginBottom: 10 }}>Owner</div>
+      <div style={{ marginBottom: 20 }}>👑 {state.owner} <span className="tw-label-muted">— protégé, non modifiable</span></div>
+      <div style={{ fontWeight: 600, marginBottom: 10 }}>À propos de la sécurité de cette instance</div>
+      <p className="tw-label-muted" style={{ lineHeight: 1.7 }}>
+        Cette version stocke ses données dans le <code>localStorage</code> de votre navigateur : elles restent sur
+        cet appareil et ne sont pas partagées avec les autres membres. Toutes les mutations (création de
+        signalement, changement de statut, attribution de rôle…) passent par un module unique qui revérifie le
+        rôle de l'auteur avant d'agir, afin qu'aucune action ne dépende uniquement de ce qui est affiché à l'écran.
+        Pour une vraie plateforme communautaire où tout le monde voit les mêmes signalements, il faut remplacer
+        cette couche de stockage par un vrai backend (Supabase, Firebase ou une API Node.js dédiée) — un
+        environnement purement client, comme celui-ci, ne peut jamais garantir une sécurité totale face à un
+        utilisateur déterminé à modifier le code de la page.
+      </p>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<TamayaWatch />);
+</script>
+</body>
+</html>
